@@ -1918,6 +1918,14 @@ impl PlayerInternal {
         };
         let normalisation_factor =
             NormalisationData::get_factor(&config, loaded_track.normalisation_data);
+        if let Some(report) = &config.normalisation_report {
+            let reported = if config.normalisation {
+                normalisation_factor
+            } else {
+                1.0
+            };
+            report.store(reported.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
 
         if start_playback {
             self.ensure_sink_running();

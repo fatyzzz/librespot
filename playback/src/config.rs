@@ -110,6 +110,9 @@ pub struct PlayerConfig {
     pub normalisation: bool,
     pub normalisation_type: NormalisationType,
     pub normalisation_method: NormalisationMethod,
+    /// Where to report the loaded track's normalisation factor, for a
+    /// host that wants to undo it for a visualiser.
+    pub normalisation_report: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     pub normalisation_pregain_db: f64,
     pub normalisation_threshold_dbfs: f64,
     pub normalisation_attack_cf: f64,
@@ -134,6 +137,7 @@ impl Default for PlayerConfig {
             normalisation: false,
             normalisation_type: NormalisationType::default(),
             normalisation_method: NormalisationMethod::default(),
+            normalisation_report: None,
             normalisation_pregain_db: 0.0,
             normalisation_threshold_dbfs: -2.0,
             normalisation_attack_cf: duration_to_coefficient(Duration::from_millis(5)),
