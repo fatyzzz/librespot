@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [core] Include socket and proxy setup in the access-point connection timeout so retries can proceed
 - [playback] Stop instead of advancing through the queue when Spotify refuses an audio key
 - [core] Pass on dealer messages that carry plain JSON, such as collection updates, instead of dropping them with a base64 warning
 - [core] Fixed AP login on Windows on ARM by using the supported desktop platform identifier
