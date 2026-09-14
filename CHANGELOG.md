@@ -61,6 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [core] Try all resolved TCP addresses, with prompt IPv4/IPv6 fallback and bounded connection setup, instead of discarding working fallback addresses
 - [connect] Fixed failed transferring with transfer data that had an empty context uri and no tracks
 - [connect] Use the provided index or the first as fallback value to always play a track on loading
 - [core] Fixed a problem where the metadata didn't include the audio file by switching to `get_extended_metadata`
