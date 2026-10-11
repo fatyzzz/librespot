@@ -104,7 +104,6 @@ pub async fn authenticate(
 
     let cpu_family = match std::env::consts::ARCH {
         "blackfin" => CpuFamily::CPU_BLACKFIN,
-        "arm" | "aarch64" => CpuFamily::CPU_ARM,
         "ia64" => CpuFamily::CPU_IA64,
         "mips" => CpuFamily::CPU_MIPS,
         "ppc" => CpuFamily::CPU_PPC,
@@ -112,6 +111,9 @@ pub async fn authenticate(
         "sh" => CpuFamily::CPU_SH,
         "x86" => CpuFamily::CPU_X86,
         "x86_64" => CpuFamily::CPU_X86_64,
+        // Windows on ARM must report the desktop CPU family alongside the Win32 platform.
+        "arm" | "aarch64" if crate::config::OS == "windows" => CpuFamily::CPU_X86_64,
+        "arm" | "aarch64" => CpuFamily::CPU_ARM,
         _ => CpuFamily::CPU_UNKNOWN,
     };
 
