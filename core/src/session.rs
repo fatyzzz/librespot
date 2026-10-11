@@ -3,7 +3,6 @@ use std::{
     future::Future,
     io,
     pin::Pin,
-    process::exit,
     sync::{Arc, OnceLock, RwLock, Weak},
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -361,16 +360,18 @@ impl Session {
         );
     }
 
-    fn check_catalogue(attributes: &UserAttributes) {
+    /// Whether the account may use librespot. A host keeps running when it
+    /// may not: the session shuts down instead, and the account type stays
+    /// readable through `get_user_attribute("type")`.
+    fn check_catalogue(attributes: &UserAttributes) -> bool {
         if let Some(account_type) = attributes.get("type") {
             if account_type != "premium" {
                 error!("librespot does not support {account_type:?} accounts.");
                 info!("Please support Spotify and your artists and sign up for a premium account.");
-
-                // TODO: logout instead of exiting
-                exit(1);
+                return false;
             }
         }
+        true
     }
 
     pub fn send_packet(&self, cmd: PacketType, data: Vec<u8>) -> Result<(), Error> {
@@ -597,19 +598,24 @@ impl Session {
     pub fn set_user_attribute(&self, key: &str, value: &str) -> Option<String> {
         let mut dummy_attributes = UserAttributes::new();
         dummy_attributes.insert(key.to_owned(), value.to_owned());
-        Self::check_catalogue(&dummy_attributes);
+        let supported = Self::check_catalogue(&dummy_attributes);
 
-        self.0
+        let previous = self
+            .0
             .data
             .write()
             .expect(SESSION_DATA_POISON_MSG)
             .user_data
             .attributes
-            .insert(key.to_owned(), value.to_owned())
+            .insert(key.to_owned(), value.to_owned());
+        if !supported {
+            self.shutdown();
+        }
+        previous
     }
 
     pub fn set_user_attributes(&self, attributes: UserAttributes) {
-        Self::check_catalogue(&attributes);
+        let supported = Self::check_catalogue(&attributes);
 
         self.0
             .data
@@ -617,7 +623,10 @@ impl Session {
             .expect(SESSION_DATA_POISON_MSG)
             .user_data
             .attributes
-            .extend(attributes)
+            .extend(attributes);
+        if !supported {
+            self.shutdown();
+        }
     }
 
     pub fn get_user_attribute(&self, key: &str) -> Option<String> {
@@ -844,7 +853,7 @@ where
                 }
 
                 trace!("Received product info: {user_attributes:#?}");
-                Session::check_catalogue(&user_attributes);
+                let supported = Session::check_catalogue(&user_attributes);
 
                 session
                     .0
@@ -853,6 +862,9 @@ where
                     .expect(SESSION_DATA_POISON_MSG)
                     .user_data
                     .attributes = user_attributes;
+                if !supported {
+                    session.shutdown();
+                }
                 Ok(())
             }
             Some(SecretBlock)
