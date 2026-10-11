@@ -20,7 +20,7 @@ use crate::{
         connect::{Cluster, ClusterUpdate, LogoutCommand, SetVolumeCommand},
         context::Context,
         explicit_content_pubsub::UserAttributesUpdate,
-        player::ProvidedTrack,
+        player::{PlayerState, ProvidedTrack},
         playlist4_external::PlaylistModificationInfo,
         social_connect_v2::SessionUpdate,
         transfer_state::TransferState,
@@ -42,7 +42,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{
+    sync::{mpsc, watch},
+    time::sleep,
+};
 
 #[derive(Debug, Error)]
 enum SpircError {
@@ -71,6 +74,8 @@ impl From<SpircError> for Error {
 
 struct SpircTask {
     disconnected_playback: Arc<Mutex<Option<Arc<PlaybackSnapshot>>>>,
+    /// the player state last published while this device was active
+    playback_state: watch::Sender<Option<Arc<PlayerState>>>,
     player: Arc<Player>,
     mixer: Arc<dyn Mixer>,
 
@@ -152,6 +157,7 @@ const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
 pub struct Spirc {
     commands: mpsc::UnboundedSender<SpircCommand>,
     disconnected_playback: Arc<Mutex<Option<Arc<PlaybackSnapshot>>>>,
+    playback_state: watch::Receiver<Option<Arc<PlayerState>>>,
 }
 
 /// In-memory playback retained when an active Connect session unexpectedly ends.
@@ -204,6 +210,13 @@ impl Spirc {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// The local player state (current track, context, next and previous
+    /// tracks, options) as last sent to Spotify while this device is active;
+    /// `None` while it is inactive. The receiver sees every published change.
+    pub fn playback_state(&self) -> watch::Receiver<Option<Arc<PlayerState>>> {
+        self.playback_state.clone()
     }
 
     /// Restore a disconnected session on this device, retaining queue order.
@@ -290,8 +303,10 @@ impl Spirc {
         let player_events = player.get_player_event_channel();
 
         let disconnected_playback = Arc::new(Mutex::new(None));
+        let (playback_state, playback_state_rx) = watch::channel(None);
         let mut task = SpircTask {
             disconnected_playback: Arc::clone(&disconnected_playback),
+            playback_state,
             player,
             mixer,
 
@@ -330,6 +345,7 @@ impl Spirc {
         let spirc = Spirc {
             commands: cmd_tx,
             disconnected_playback,
+            playback_state: playback_state_rx,
         };
 
         let initial_volume = task.connect_state.device_info().volume;
@@ -688,6 +704,8 @@ impl SpircTask {
                 error!("error during disconnecting: {why}")
             }
         }
+
+        self.playback_state.send_replace(None);
 
         // this should clear the active session id, leaving an empty state
         if let Err(why) = self.session.spclient().delete_connect_state_request().await {
@@ -1124,6 +1142,7 @@ impl SpircTask {
             }
         } else if self.connect_state.is_active() {
             self.connect_state.became_inactive(&self.session).await?;
+            self.publish_playback_state();
         }
 
         Ok(())
@@ -1409,6 +1428,7 @@ impl SpircTask {
         self.notify().await?;
 
         self.connect_state.became_inactive(&self.session).await?;
+        self.publish_playback_state();
 
         self.player
             .emit_session_disconnected_event(self.session.connection_id(), self.session.username());
@@ -2016,11 +2036,27 @@ impl SpircTask {
         }
 
         self.connect_state.set_now(self.now_ms() as u64);
+        self.publish_playback_state();
 
         self.connect_state
             .send_state(&self.session)
             .await
             .map(|_| ())
+    }
+
+    /// Share the player state with [Spirc::playback_state] (`None` while inactive).
+    fn publish_playback_state(&self) {
+        let state = self
+            .connect_state
+            .is_active()
+            .then(|| Arc::new(self.connect_state.player().clone()));
+        self.playback_state.send_if_modified(|current| {
+            if current.is_none() && state.is_none() {
+                return false;
+            }
+            *current = state;
+            true
+        });
     }
 
     fn set_volume(&mut self, volume: u16) {
