@@ -1824,7 +1824,7 @@ impl PlayerInternal {
         normalisation_factor: f64,
     ) {
         match packet {
-            Some((_, mut packet)) => {
+            Some((position, mut packet)) => {
                 if !packet.is_empty() {
                     if let AudioPacket::Samples(ref mut data) = packet {
                         // Get the volume for the packet. In the case of hardware volume control
@@ -1919,6 +1919,16 @@ impl PlayerInternal {
                         }
                     }
 
+                    if let Some(report) = &self.config.playback_report {
+                        use std::sync::atomic::Ordering;
+                        report
+                            .position_ms
+                            .store(position.position_ms, Ordering::Relaxed);
+                        report.next_ready.store(
+                            matches!(self.preload, PlayerPreload::Ready { .. }),
+                            Ordering::Relaxed,
+                        );
+                    }
                     if let Err(e) = self.sink.write(packet, &mut self.converter) {
                         error!("{e}");
                         self.handle_pause();
@@ -1976,6 +1986,15 @@ impl PlayerInternal {
                 1.0
             };
             report.store(reported.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(report) = &config.playback_report {
+            use std::sync::atomic::Ordering;
+            report
+                .duration_ms
+                .store(loaded_track.duration_ms, Ordering::Relaxed);
+            report.position_ms.store(position_ms, Ordering::Relaxed);
+            report.next_ready.store(false, Ordering::Relaxed);
+            report.track.fetch_add(1, Ordering::Relaxed);
         }
 
         if start_playback {

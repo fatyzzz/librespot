@@ -1860,6 +1860,7 @@ async fn get_setup() -> Setup {
             normalisation_release_cf,
             normalisation_knee_db,
             normalisation_report: None,
+            playback_report: None,
             ditherer,
             position_update_interval: None,
             local_file_directories,

@@ -101,6 +101,21 @@ impl FromStr for NormalisationMethod {
     }
 }
 
+/// What the player is feeding its sink. The player thread updates it before
+/// each write, so a sink reads it in step with the audio it receives.
+#[derive(Debug, Default)]
+pub struct PlaybackReport {
+    /// Changes each time a track starts playing, including another play of
+    /// the same track. A gapless transition shows up here and nowhere else.
+    pub track: std::sync::atomic::AtomicU64,
+    /// The playing track's duration in milliseconds.
+    pub duration_ms: std::sync::atomic::AtomicU32,
+    /// Where in the track the packet being written starts, in milliseconds.
+    pub position_ms: std::sync::atomic::AtomicU32,
+    /// The next track is loaded, so it will follow this one without a gap.
+    pub next_ready: std::sync::atomic::AtomicBool,
+}
+
 #[derive(Clone)]
 pub struct PlayerConfig {
     pub bitrate: Bitrate,
@@ -113,6 +128,9 @@ pub struct PlayerConfig {
     /// Where to report the loaded track's normalisation factor, for a
     /// host that wants to undo it for a visualiser.
     pub normalisation_report: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Where to report what the sink is being fed, for a host sink that
+    /// shapes track transitions itself, such as a crossfade.
+    pub playback_report: Option<std::sync::Arc<PlaybackReport>>,
     pub normalisation_pregain_db: f64,
     pub normalisation_threshold_dbfs: f64,
     pub normalisation_attack_cf: f64,
@@ -138,6 +156,7 @@ impl Default for PlayerConfig {
             normalisation_type: NormalisationType::default(),
             normalisation_method: NormalisationMethod::default(),
             normalisation_report: None,
+            playback_report: None,
             normalisation_pregain_db: 0.0,
             normalisation_threshold_dbfs: -2.0,
             normalisation_attack_cf: duration_to_coefficient(Duration::from_millis(5)),
