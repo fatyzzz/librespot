@@ -9,6 +9,9 @@ use std::ops::Deref;
 pub struct LoadRequest {
     pub(super) context: PlayContext,
     pub(super) options: LoadRequestOptions,
+    /// the per-listener session the context plays from, as a Play command
+    /// for the DJ carries it
+    pub(super) session_url: Option<String>,
 }
 
 impl Deref for LoadRequest {
@@ -93,6 +96,7 @@ impl LoadRequest {
         Self {
             context: PlayContext::Uri(context_uri),
             options,
+            session_url: None,
         }
     }
 
@@ -104,6 +108,7 @@ impl LoadRequest {
         Self {
             context: PlayContext::Tracks(tracks),
             options,
+            session_url: None,
         }
     }
 }

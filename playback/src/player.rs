@@ -29,6 +29,7 @@ use crate::{
     local_file::{LocalFileLookup, create_local_file_lookup},
     metadata::audio::{AudioFileFormat, AudioFiles, AudioItem},
     mixer::VolumeGetter,
+    narration::{Clips, Narration, Part, TrackNarration},
 };
 use futures_util::{
     StreamExt, TryFutureExt, future, future::FusedFuture,
@@ -95,7 +96,28 @@ struct PlayerInternal {
     last_progress_update: Instant,
 
     local_file_lookup: Arc<LocalFileLookup>,
+
+    /// The DJ's lines being voiced or ready to say.
+    clips: Clips,
+    /// What the DJ says around the play the player is on.
+    narration: Option<TrackNarration>,
+    /// What the DJ says around the preloaded track.
+    preload_narration: Narration,
 }
+
+/// What the DJ's narration needs from the player loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drive {
+    /// Nothing to say: play the track.
+    Idle,
+    /// Said something, or finished a line.
+    Busy,
+    /// A line is due but not voiced yet; the track waits for it.
+    Waiting,
+}
+
+/// How much of a DJ line goes to the sink at a time: about 93 ms.
+const NARRATION_CHUNK_SAMPLES: usize = 4096 * 2;
 
 static PLAYER_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -104,9 +126,11 @@ enum PlayerCommand {
         track_id: SpotifyUri,
         play: bool,
         position_ms: u32,
+        narration: Narration,
     },
     Preload {
         track_id: SpotifyUri,
+        narration: Narration,
     },
     Play,
     Pause,
@@ -266,6 +290,17 @@ pub enum PlayerEvent {
     FilterExplicitContentChanged {
         filter: bool,
     },
+    /// The DJ started saying a line around the track. The track's position
+    /// holds still until `NarrationEnded`.
+    NarrationStarted {
+        play_request_id: u64,
+        track_id: SpotifyUri,
+    },
+    /// The DJ finished or stopped saying a line.
+    NarrationEnded {
+        play_request_id: u64,
+        track_id: SpotifyUri,
+    },
     /// Fired when the queue is set or context is loaded with its track list.
     SetQueue {
         context_uri: String,
@@ -307,6 +342,12 @@ impl PlayerEvent {
                 play_request_id, ..
             }
             | Seeked {
+                play_request_id, ..
+            }
+            | NarrationStarted {
+                play_request_id, ..
+            }
+            | NarrationEnded {
                 play_request_id, ..
             } => Some(*play_request_id),
             _ => None,
@@ -538,6 +579,10 @@ impl Player {
                 last_progress_update: Instant::now(),
 
                 local_file_lookup: Arc::new(local_file_lookup),
+
+                clips: Clips::default(),
+                narration: None,
+                preload_narration: Narration::default(),
             };
 
             // While PlayerInternal is written as a future, it still contains blocking code.
@@ -570,15 +615,36 @@ impl Player {
     }
 
     pub fn load(&self, track_id: SpotifyUri, start_playing: bool, position_ms: u32) {
+        self.load_with_narration(track_id, start_playing, position_ms, Narration::default());
+    }
+
+    /// As `load`, with the DJ's lines to say around this play of the track.
+    pub fn load_with_narration(
+        &self,
+        track_id: SpotifyUri,
+        start_playing: bool,
+        position_ms: u32,
+        narration: Narration,
+    ) {
         self.command(PlayerCommand::Load {
             track_id,
             play: start_playing,
             position_ms,
+            narration,
         });
     }
 
     pub fn preload(&self, track_id: SpotifyUri) {
-        self.command(PlayerCommand::Preload { track_id });
+        self.preload_with_narration(track_id, Narration::default());
+    }
+
+    /// As `preload`, voicing ahead the DJ's lines for the track, so they
+    /// are ready when it starts.
+    pub fn preload_with_narration(&self, track_id: SpotifyUri, narration: Narration) {
+        self.command(PlayerCommand::Preload {
+            track_id,
+            narration,
+        });
     }
 
     pub fn play(&self) {
@@ -1504,10 +1570,16 @@ impl Future for PlayerInternal {
                 }
             }
 
+            let mut waiting_for_narration = false;
             if self.state.is_playing() {
                 self.ensure_sink_running();
 
-                if let PlayerState::Playing {
+                let drive = self.drive_narration(cx);
+                if drive == Drive::Waiting {
+                    waiting_for_narration = true;
+                } else if drive == Drive::Busy {
+                    // a line went to the sink, which paced it
+                } else if let PlayerState::Playing {
                     ref track_id,
                     play_request_id,
                     ref mut decoder,
@@ -1612,7 +1684,15 @@ impl Future for PlayerInternal {
                                 }
                             }
 
-                            self.handle_packet(result, normalisation_factor);
+                            if result.is_none() && self.line_after_track(play_request_id) {
+                                // The DJ's line after the track plays before
+                                // the track counts as over.
+                                if let Some(playing) = self.narration.as_mut() {
+                                    playing.advance();
+                                }
+                            } else {
+                                self.handle_packet(result, normalisation_factor);
+                            }
                         }
                         Err(e) => {
                             error!(
@@ -1664,7 +1744,9 @@ impl Future for PlayerInternal {
                 }
             }
 
-            if (!self.state.is_playing()) && all_futures_completed_or_not_ready {
+            if (!self.state.is_playing() || waiting_for_narration)
+                && all_futures_completed_or_not_ready
+            {
                 return Poll::Pending;
             }
         }
@@ -1745,6 +1827,8 @@ impl PlayerInternal {
             } => {
                 let track_id = track_id.clone();
 
+                self.stop_narrating();
+                self.narration = None;
                 self.ensure_sink_stopped(false);
                 self.send_event(PlayerEvent::Stopped {
                     track_id,
@@ -1924,10 +2008,19 @@ impl PlayerInternal {
                         report
                             .position_ms
                             .store(position.position_ms, Ordering::Relaxed);
+                        // A DJ line between this track and the next keeps
+                        // them apart, so the next one isn't ready to follow
+                        // straight on.
+                        let line_between = self
+                            .narration
+                            .as_ref()
+                            .is_some_and(TrackNarration::speaks_after)
+                            || self.preload_narration.before.is_some();
                         report.next_ready.store(
-                            matches!(self.preload, PlayerPreload::Ready { .. }),
+                            matches!(self.preload, PlayerPreload::Ready { .. }) && !line_between,
                             Ordering::Relaxed,
                         );
+                        report.narrating.store(false, Ordering::Relaxed);
                     }
                     if let Err(e) = self.sink.write(packet, &mut self.converter) {
                         error!("{e}");
@@ -1994,6 +2087,7 @@ impl PlayerInternal {
                 .store(loaded_track.duration_ms, Ordering::Relaxed);
             report.position_ms.store(position_ms, Ordering::Relaxed);
             report.next_ready.store(false, Ordering::Relaxed);
+            report.narrating.store(false, Ordering::Relaxed);
             report.track.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -2053,11 +2147,15 @@ impl PlayerInternal {
         play_request_id_option: Option<u64>,
         play: bool,
         position_ms: u32,
+        narration: Narration,
     ) -> PlayerResult {
         let play_request_id =
             play_request_id_option.unwrap_or(self.play_request_id_generator.get());
 
+        // the line of the play being replaced ends under its own id
+        self.stop_narrating();
         self.send_event(PlayerEvent::PlayRequestIdChanged { play_request_id });
+        self.set_narration(play_request_id, narration);
 
         if !self.config.gapless {
             self.ensure_sink_stopped(play);
@@ -2258,8 +2356,14 @@ impl PlayerInternal {
         Ok(())
     }
 
-    fn handle_command_preload(&mut self, track_id: SpotifyUri) {
+    fn handle_command_preload(&mut self, track_id: SpotifyUri, narration: Narration) {
         debug!("Preloading track");
+        self.preload_narration = if self.narration_enabled() {
+            self.clips.request(&self.session, &narration);
+            narration
+        } else {
+            Narration::default()
+        };
         let mut preload_track = true;
         // check whether the track is already loaded somewhere or being loaded.
         if let PlayerPreload::Loading {
@@ -2321,13 +2425,25 @@ impl PlayerInternal {
             ..
         } = self.state
         {
+            // A seek chooses where to listen: the line before the track is
+            // skipped, the one after it kept.
+            let narration = Narration {
+                before: None,
+                after: self
+                    .narration
+                    .take()
+                    .and_then(|playing| playing.narration.after),
+            };
             return self.handle_command_load(
                 track_id.clone(),
                 Some(play_request_id),
                 start_playback,
                 position_ms,
+                narration,
             );
         }
+
+        self.stop_narrating();
 
         if let Some(decoder) = self.state.decoder() {
             match decoder.seek(position_ms) {
@@ -2382,9 +2498,13 @@ impl PlayerInternal {
                 track_id,
                 play,
                 position_ms,
-            } => self.handle_command_load(track_id, None, play, position_ms)?,
+                narration,
+            } => self.handle_command_load(track_id, None, play, position_ms, narration)?,
 
-            PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
+            PlayerCommand::Preload {
+                track_id,
+                narration,
+            } => self.handle_command_preload(track_id, narration),
 
             PlayerCommand::Seek(position_ms) => self.handle_command_seek(position_ms)?,
 
@@ -2496,6 +2616,202 @@ impl PlayerInternal {
         Ok(())
     }
 
+    /// Takes on the DJ's lines for a new play of a track, voicing any not
+    /// voiced yet, and forgets the clips no longer needed.
+    fn set_narration(&mut self, play_request_id: u64, narration: Narration) {
+        let enabled = self.narration_enabled();
+        // whatever was preloaded is taken or dropped by this load
+        self.preload_narration = Narration::default();
+        self.narration = (enabled && !narration.is_empty()).then(|| {
+            self.clips.request(&self.session, &narration);
+            TrackNarration::new(play_request_id, narration)
+        });
+        let playing = self.narration.as_ref().map(|playing| &playing.narration);
+        let keep: Vec<&Narration> = playing
+            .into_iter()
+            .chain(std::iter::once(&self.preload_narration))
+            .collect();
+        self.clips.retain(&keep);
+    }
+
+    /// Whether to say the DJ's lines: they are decoded audio, which a
+    /// passthrough sink can't take.
+    fn narration_enabled(&self) -> bool {
+        self.config.narration.load(Ordering::Relaxed) && !self.config.passthrough
+    }
+
+    /// Whether the DJ has a line to say once the track `play_request_id`
+    /// plays to its end.
+    fn line_after_track(&self, play_request_id: u64) -> bool {
+        self.narration_enabled()
+            && self.narration.as_ref().is_some_and(|playing| {
+                playing.play_request_id == play_request_id && playing.speaks_after()
+            })
+    }
+
+    /// Says the DJ's line due now, a piece at a time, or reports that there
+    /// is none and the track should play.
+    fn drive_narration(&mut self, cx: &mut Context<'_>) -> Drive {
+        let (track_id, play_request_id) = match &self.state {
+            PlayerState::Playing {
+                track_id,
+                play_request_id,
+                ..
+            } => (track_id.clone(), *play_request_id),
+            _ => return Drive::Idle,
+        };
+        let enabled = self.narration_enabled();
+        let Some(playing) = self.narration.as_mut() else {
+            return Drive::Idle;
+        };
+        if playing.play_request_id != play_request_id {
+            self.narration = None;
+            return Drive::Idle;
+        }
+        if !playing.active() {
+            return Drive::Idle;
+        }
+        if !enabled {
+            // Turned off: whatever is left of the line goes unsaid.
+            self.finish_line();
+            return Drive::Busy;
+        }
+
+        if playing.speaking.is_none() {
+            let Some(script) = playing.script().cloned() else {
+                self.finish_line();
+                return Drive::Busy;
+            };
+            match self.clips.poll(&script, cx) {
+                Poll::Pending => return Drive::Waiting,
+                Poll::Ready(None) => {
+                    self.finish_line();
+                    return Drive::Busy;
+                }
+                Poll::Ready(Some(clip)) => {
+                    if let Some(playing) = self.narration.as_mut() {
+                        playing.speaking = Some((clip, 0));
+                    }
+                    self.send_event(PlayerEvent::NarrationStarted {
+                        play_request_id,
+                        track_id: track_id.clone(),
+                    });
+                }
+            }
+        }
+
+        let Some((clip, offset)) = self
+            .narration
+            .as_ref()
+            .and_then(|playing| playing.speaking.clone())
+        else {
+            return Drive::Busy;
+        };
+        let end = (offset + NARRATION_CHUNK_SAMPLES).min(clip.samples.len());
+        let mut data = clip.samples[offset..end].to_vec();
+        let volume = self.volume_getter.attenuation_factor();
+        if volume < 1.0 {
+            for sample in data.iter_mut() {
+                *sample *= volume;
+            }
+        }
+        if let Some(report) = &self.config.playback_report {
+            report.narrating.store(true, Ordering::Relaxed);
+            report.next_ready.store(false, Ordering::Relaxed);
+        }
+        if let Some(playing) = self.narration.as_mut() {
+            playing.speaking = Some((Arc::clone(&clip), end));
+        }
+        if !data.is_empty() {
+            if let Err(e) = self
+                .sink
+                .write(AudioPacket::Samples(data), &mut self.converter)
+            {
+                error!("{e}");
+                self.handle_pause();
+                return Drive::Busy;
+            }
+        }
+        if end >= clip.samples.len() {
+            self.finish_line();
+        }
+        Drive::Busy
+    }
+
+    /// Ends the DJ's current line, said or not, and moves on: to the track
+    /// after the line before it, or past the track after the line after it.
+    fn finish_line(&mut self) {
+        let Some(playing) = self.narration.as_mut() else {
+            return;
+        };
+        let spoke = playing.speaking.is_some();
+        let part = playing.part();
+        let play_request_id = playing.play_request_id;
+        playing.advance();
+        if let Some(report) = &self.config.playback_report {
+            report.narrating.store(false, Ordering::Relaxed);
+        }
+        let track_id = match &self.state {
+            PlayerState::Playing { track_id, .. } | PlayerState::Paused { track_id, .. } => {
+                Some(track_id.clone())
+            }
+            _ => None,
+        };
+        if let (true, Some(track_id)) = (spoke, track_id) {
+            self.send_event(PlayerEvent::NarrationEnded {
+                play_request_id,
+                track_id,
+            });
+        }
+        match part {
+            Some(Part::Before) => {
+                // The track starts only now: report its position afresh.
+                if let PlayerState::Playing {
+                    ref mut reported_nominal_start_time,
+                    ..
+                } = self.state
+                {
+                    *reported_nominal_start_time = None;
+                }
+            }
+            // the line after the track was the end of it
+            Some(Part::After) if self.state.is_playing() => self.handle_packet(None, 1.0),
+            Some(Part::After) | None => {}
+        }
+    }
+
+    /// Stops a line part way, for a seek, a stop or another track: the
+    /// track carries on (or ends) without the rest of it.
+    fn stop_narrating(&mut self) {
+        let Some(playing) = self.narration.as_mut() else {
+            return;
+        };
+        if !playing.active() {
+            return;
+        }
+        let spoke = playing.speaking.take().is_some();
+        let play_request_id = playing.play_request_id;
+        // past the line, but never past the track: a seek during the line
+        // after the track goes back into it
+        playing.stage = crate::narration::Stage::Track;
+        if let Some(report) = &self.config.playback_report {
+            report.narrating.store(false, Ordering::Relaxed);
+        }
+        let track_id = match &self.state {
+            PlayerState::Playing { track_id, .. }
+            | PlayerState::Paused { track_id, .. }
+            | PlayerState::Loading { track_id, .. }
+            | PlayerState::EndOfTrack { track_id, .. } => Some(track_id.clone()),
+            _ => None,
+        };
+        if let (true, Some(track_id)) = (spoke, track_id) {
+            self.send_event(PlayerEvent::NarrationEnded {
+                play_request_id,
+                track_id,
+            });
+        }
+    }
+
     fn send_event(&mut self, event: PlayerEvent) {
         self.event_senders
             .retain(|sender| sender.send(event.clone()).is_ok());
@@ -2596,7 +2912,7 @@ impl fmt::Debug for PlayerCommand {
                 .field(&play)
                 .field(&position_ms)
                 .finish(),
-            PlayerCommand::Preload { track_id } => {
+            PlayerCommand::Preload { track_id, .. } => {
                 f.debug_tuple("Preload").field(&track_id).finish()
             }
             PlayerCommand::Play => f.debug_tuple("Play").finish(),

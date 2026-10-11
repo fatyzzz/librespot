@@ -301,8 +301,9 @@ impl ConnectState {
                 supports_external_episodes: false,
                 supports_set_backend_metadata: false,
                 supports_hifi: MessageField::none(),
-                // that "AI" dj thingy only available to specific regions/users
-                supports_dj: false,
+                // the DJ: its sets are paged in as they run out and its
+                // lines are voiced by the player (see `librespot_playback::narration`)
+                supports_dj: true,
                 supports_rooms: false,
                 // AudioQuality::HIFI is available, further investigation necessary
                 supported_audio_quality: EnumOrUnknown::new(AudioQuality::VERY_HIGH),

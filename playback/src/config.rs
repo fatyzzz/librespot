@@ -113,7 +113,12 @@ pub struct PlaybackReport {
     /// Where in the track the packet being written starts, in milliseconds.
     pub position_ms: std::sync::atomic::AtomicU32,
     /// The next track is loaded, so it will follow this one without a gap.
+    /// Never set while a DJ line is due between the two: the track ends,
+    /// the line is said, and only then does the next track start.
     pub next_ready: std::sync::atomic::AtomicBool,
+    /// The packet being written is a DJ line, not the track. The track's
+    /// position holds still while it plays.
+    pub narrating: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -131,6 +136,10 @@ pub struct PlayerConfig {
     /// Where to report what the sink is being fed, for a host sink that
     /// shapes track transitions itself, such as a crossfade.
     pub playback_report: Option<std::sync::Arc<PlaybackReport>>,
+    /// Whether to say the DJ's lines around its tracks. Read at each track
+    /// change and while a line plays, so turning it off silences the DJ at
+    /// once; the music plays on either way.
+    pub narration: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub normalisation_pregain_db: f64,
     pub normalisation_threshold_dbfs: f64,
     pub normalisation_attack_cf: f64,
@@ -157,6 +166,7 @@ impl Default for PlayerConfig {
             normalisation_method: NormalisationMethod::default(),
             normalisation_report: None,
             playback_report: None,
+            narration: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             normalisation_pregain_db: 0.0,
             normalisation_threshold_dbfs: -2.0,
             normalisation_attack_cf: duration_to_coefficient(Duration::from_millis(5)),

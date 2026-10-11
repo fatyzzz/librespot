@@ -1861,6 +1861,7 @@ async fn get_setup() -> Setup {
             normalisation_knee_db,
             normalisation_report: None,
             playback_report: None,
+            narration: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             ditherer,
             position_update_interval: None,
             local_file_directories,

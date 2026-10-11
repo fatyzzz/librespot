@@ -28,6 +28,9 @@ pub struct StateContext {
     pub restrictions: Option<Restrictions>,
     /// is used to keep track which tracks are already loaded into the next_tracks
     pub index: ContextIndex,
+    /// where the context continues, for a context handed out a page at a
+    /// time, such as the DJ's sets
+    pub next_page_url: Option<String>,
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Hash, Eq)]
@@ -197,6 +200,12 @@ impl ConnectState {
             Err(StateError::UnsupportedLocalPlayback)?;
         }
 
+        let next_page_url = context
+            .pages
+            .last()
+            .and_then(|page| page.next_page_url.clone())
+            .filter(|url| !url.is_empty());
+
         let mut next_contexts = Vec::new();
         let mut first_page = None;
         for page in context.pages {
@@ -251,6 +260,7 @@ impl ConnectState {
                     }
                 }
 
+                new_context.next_page_url = next_page_url;
                 self.context = Some(new_context);
 
                 if !matches!(context.url, Some(ref url) if url.contains(SEARCH_IDENTIFIER)) {
@@ -380,6 +390,7 @@ impl ConnectState {
             restrictions,
             metadata,
             index: ContextIndex::new(),
+            next_page_url: None,
         }
     }
 
@@ -502,7 +513,36 @@ impl ConnectState {
         Ok(track)
     }
 
+    /// Where the current context continues past its loaded tracks, when it
+    /// is handed out a page at a time.
+    pub fn next_page_url(&self) -> Option<&str> {
+        self.context.as_ref()?.next_page_url.as_deref()
+    }
+
+    /// The URL of the per-listener session a context is played from, such
+    /// as the DJ's, from its `url` or its `lexicon_context_url` metadata.
+    pub fn session_url(context: &Context) -> Option<String> {
+        context
+            .url
+            .as_deref()
+            .filter(|url| url.starts_with("hm://"))
+            .or_else(|| {
+                context
+                    .metadata
+                    .get("lexicon_context_url")
+                    .map(String::as_str)
+            })
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Whether the current context is played from a per-listener session.
+    pub fn plays_from_session(&self) -> bool {
+        self.player().context_url.starts_with("hm://")
+    }
+
     pub fn fill_context_from_page(&mut self, page: ContextPage) -> Result<(), Error> {
+        let next_page_url = page.next_page_url.clone().filter(|url| !url.is_empty());
         let ctx_len = self.context.as_ref().map(|c| c.tracks.len());
         let context = self.state_context_from_page(page, HashMap::new(), None, None, ctx_len, None);
 
@@ -514,7 +554,114 @@ impl ConnectState {
         for t in context.tracks {
             ctx.tracks.push(t)
         }
+        ctx.next_page_url = next_page_url;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use crate::core::Session;
+
+    const DJ: &str = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
+    const SESSION: &str = "hm://lexicon-session-provider/context-resolve/v2/session?contextUri=spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
+
+    fn page(tracks: &[&str], next_page_url: Option<&str>) -> ContextPage {
+        ContextPage {
+            tracks: tracks
+                .iter()
+                .map(|id| ContextTrack {
+                    uri: Some(format!("spotify:track:{id}")),
+                    ..Default::default()
+                })
+                .collect(),
+            next_page_url: next_page_url.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn finds_the_session_a_context_plays_from() {
+        let mut context = Context {
+            uri: Some(DJ.into()),
+            url: Some(SESSION.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ConnectState::session_url(&context).as_deref(),
+            Some(SESSION)
+        );
+
+        context.url = Some(format!("context://{DJ}"));
+        assert_eq!(ConnectState::session_url(&context), None);
+        context
+            .metadata
+            .insert("lexicon_context_url".into(), SESSION.into());
+        assert_eq!(
+            ConnectState::session_url(&context).as_deref(),
+            Some(SESSION)
+        );
+
+        context
+            .metadata
+            .insert("lexicon_context_url".into(), String::new());
+        context.url = None;
+        assert_eq!(ConnectState::session_url(&context), None);
+    }
+
+    #[tokio::test]
+    async fn follows_a_context_handed_out_a_page_at_a_time() {
+        let session = Session::new(Default::default(), None);
+        let mut state = ConnectState::new(Default::default(), &session);
+
+        let first =
+            "hm://lexicon-session-provider/context-resolve/v2/session/0?previousSegmentId=1";
+        let context = Context {
+            uri: Some(DJ.into()),
+            url: Some(SESSION.into()),
+            pages: vec![page(
+                &["0d28khcov6AiegSCpG5TuT", "2m3PVx1gsVB5upxi94IW8I"],
+                Some(first),
+            )],
+            ..Default::default()
+        };
+        state.update_context(context, ContextType::Default).unwrap();
+        assert_eq!(state.next_page_url(), Some(first));
+        assert!(state.plays_from_session());
+
+        let second =
+            "hm://lexicon-session-provider/context-resolve/v2/session/0?previousSegmentId=2";
+        state
+            .fill_context_from_page(page(&["79bWkyd08EFDO0ZZuu7IRT"], Some(second)))
+            .unwrap();
+        assert_eq!(state.next_page_url(), Some(second));
+        let context = state.get_context(ContextType::Default).unwrap();
+        assert_eq!(context.tracks.len(), 3);
+        assert_eq!(
+            context.tracks[2].uri,
+            "spotify:track:79bWkyd08EFDO0ZZuu7IRT"
+        );
+
+        state
+            .fill_context_from_page(page(&["7w5jefRiOIEs0M5udJxyhd"], None))
+            .unwrap();
+        assert_eq!(state.next_page_url(), None);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_context_has_no_session_or_pages() {
+        let session = Session::new(Default::default(), None);
+        let mut state = ConnectState::new(Default::default(), &session);
+        let context = Context {
+            uri: Some("spotify:album:5LFzwirfFwBKXJQGfwmiMY".into()),
+            url: Some("context://spotify:album:5LFzwirfFwBKXJQGfwmiMY".into()),
+            pages: vec![page(&["0d28khcov6AiegSCpG5TuT"], Some(""))],
+            ..Default::default()
+        };
+        state.update_context(context, ContextType::Default).unwrap();
+        assert_eq!(state.next_page_url(), None);
+        assert!(!state.plays_from_session());
     }
 }

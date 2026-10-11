@@ -12,12 +12,14 @@ use crate::{
     error::ErrorKind,
     protocol::{
         autoplay_context_request::AutoplayContextRequest,
+        client_tts::{TtsRequest, TtsResponse},
         clienttoken_http::{
             ChallengeAnswer, ChallengeType, ClientTokenRequest, ClientTokenRequestType,
             ClientTokenResponse, ClientTokenResponseType,
         },
         connect::PutStateRequest,
         context::Context,
+        context_page::ContextPage,
         extended_metadata::BatchedEntityRequest,
         extended_metadata::{BatchedExtensionResponse, EntityRequest, ExtensionQuery},
         extension_kind::ExtensionKind,
@@ -30,6 +32,7 @@ use bytes::Bytes;
 use data_encoding::HEXUPPER_PERMISSIVE;
 use futures_util::future::IntoStream;
 use http::{Uri, header::HeaderValue};
+use http_body_util::BodyExt;
 use hyper::{
     HeaderMap, Method, Request,
     header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, RANGE},
@@ -70,6 +73,8 @@ pub enum SpClientError {
     NoData,
     #[error("expected an entry to exist in {0}")]
     ExpectedEntry(&'static str),
+    #[error("the text-to-speech service answered {0} without an audio location")]
+    NoSpeech(u16),
 }
 
 impl From<SpClientError> for Error {
@@ -911,6 +916,107 @@ impl SpClient {
         Ok(ctx?)
     }
 
+    /// Resolves a context from a URL Spotify hands out for it instead of from
+    /// its URI: a DJ context carries an `hm://lexicon-session-provider/...`
+    /// session URL in its `url`, and `/context-resolve` knows nothing of it.
+    pub async fn get_context_from_url(&self, url: &str) -> Result<Context, Error> {
+        let endpoint = url.trim_start_matches("hm:/");
+        let res = self
+            .request_with_options(&Method::GET, endpoint, None, None, &Default::default())
+            .await?;
+        let ctx_json = String::from_utf8(res.to_vec())?;
+        if ctx_json.is_empty() {
+            Err(SpClientError::NoData)?
+        }
+
+        let ctx = protobuf_json_mapping::parse_from_str::<Context>(&ctx_json);
+        if ctx.is_err() {
+            trace!("failed parsing context: {ctx_json}")
+        }
+
+        Ok(ctx?)
+    }
+
+    /// The URL of the per-listener session behind a context that has no
+    /// track list of its own, such as the DJ (`spotify:playlist:37i9dQZF1EYkqdzj48dyYq`).
+    pub fn context_session_url(uri: &str) -> String {
+        format!("hm://lexicon-session-provider/context-resolve/v2/session?contextUri={uri}")
+    }
+
+    /// The page a context page's `next_page_url` points at. A DJ session
+    /// hands out its sets one page at a time this way.
+    pub async fn get_context_page(&self, next_page_url: &str) -> Result<ContextPage, Error> {
+        let res = self.get_next_page(next_page_url).await?;
+        let page_json = String::from_utf8(res.to_vec())?;
+        if page_json.is_empty() {
+            Err(SpClientError::NoData)?
+        }
+
+        let page = protobuf_json_mapping::parse_from_str::<ContextPage>(&page_json);
+        if page.is_err() {
+            trace!("failed parsing context page: {page_json}")
+        }
+
+        Ok(page?)
+    }
+
+    /// Asks Spotify's text-to-speech service to voice `request` and returns
+    /// where to download the audio. The service answers with a redirect to
+    /// the rendered clip on Spotify's CDN, which needs no further
+    /// authorization.
+    pub async fn get_tts_url(&self, request: &TtsRequest) -> Result<String, Error> {
+        let body = request.write_to_bytes()?;
+        let url = format!("{}/client-tts/v1/fulfill", self.base_url().await?);
+        let token = self.session().login5().auth_token().await?;
+
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(url)
+            .header(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/x-protobuf"),
+            )
+            .header(CONTENT_LENGTH, body.len())
+            .header(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("{} {}", token.token_type, token.access_token))?,
+            )
+            .body(Bytes::from(body))?;
+        match self.client_token().await {
+            Ok(client_token) => {
+                let _ = req
+                    .headers_mut()
+                    .insert(CLIENT_TOKEN, HeaderValue::from_str(&client_token)?);
+            }
+            Err(e) => warn!("Unable to get client token: {e} Trying to continue without..."),
+        }
+
+        // The answer is a redirect, which the http client would otherwise
+        // turn into an error, so the response is read here directly.
+        let response = self.session().http_client().request_fut(req)?.await?;
+        let status = response.status();
+        if status.is_redirection() {
+            if let Some(location) = response
+                .headers()
+                .get(http::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty())
+            {
+                return Ok(location.to_owned());
+            }
+        } else if status.is_success() {
+            let body = response.into_body().collect().await?.to_bytes();
+            let answer = TtsResponse::parse_from_bytes(&body)?;
+            if !answer.url.is_empty() {
+                return Ok(answer.url);
+            }
+        } else {
+            return Err(crate::http_client::HttpClientError::StatusCode(status).into());
+        }
+
+        Err(SpClientError::NoSpeech(status.as_u16()).into())
+    }
+
     pub async fn get_autoplay_context(
         &self,
         context_request: &AutoplayContextRequest,
@@ -974,11 +1080,7 @@ impl SpClient {
     }
 }
 
-fn playlist_range_endpoint(
-    playlist_id: &SpotifyId,
-    from: usize,
-    length: usize,
-) -> String {
+fn playlist_range_endpoint(playlist_id: &SpotifyId, from: usize, length: usize) -> String {
     format!(
         "/playlist/v2/playlist/{}?decorate=revision,length,attributes,owner&from={from}&length={length}",
         playlist_id.to_base62()

@@ -1,5 +1,5 @@
 use crate::{
-    core::{Error, Session},
+    core::{Error, Session, spclient::SpClient},
     protocol::{
         autoplay_context_request::AutoplayContextRequest, context::Context,
         transfer_state::TransferState,
@@ -20,6 +20,11 @@ use tokio::time::Instant;
 enum Resolve {
     Uri(String),
     Context(Context),
+    /// the next page of a context handed out a page at a time
+    Page {
+        context_uri: String,
+        url: String,
+    },
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -34,6 +39,9 @@ pub(super) struct ResolveContext {
     fallback: Option<String>,
     update: ContextType,
     action: ContextAction,
+    /// the per-listener session the context is played from, such as the
+    /// DJ's, which `/context-resolve` doesn't know
+    session_url: Option<String>,
 }
 
 impl ResolveContext {
@@ -43,7 +51,28 @@ impl ResolveContext {
             fallback: None,
             update: ContextType::Default,
             action: ContextAction::Append,
+            session_url: None,
         }
+    }
+
+    /// The page at `url` that continues the context `context_uri`.
+    pub fn from_page(context_uri: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            resolve: Resolve::Page {
+                context_uri: context_uri.into(),
+                url: url.into(),
+            },
+            fallback: None,
+            update: ContextType::Default,
+            action: ContextAction::Append,
+            session_url: None,
+        }
+    }
+
+    /// Resolves the context from the session at `url` instead of by its uri.
+    pub fn with_session_url(mut self, url: Option<String>) -> Self {
+        self.session_url = url.filter(|url| !url.is_empty());
+        self
     }
 
     pub fn from_uri(
@@ -58,6 +87,7 @@ impl ResolveContext {
             fallback: (!fallback_uri.is_empty()).then_some(fallback_uri),
             update,
             action,
+            session_url: None,
         }
     }
 
@@ -67,6 +97,7 @@ impl ResolveContext {
             fallback: None,
             update,
             action,
+            session_url: None,
         }
     }
 
@@ -79,6 +110,7 @@ impl ResolveContext {
             Resolve::Context(ref ctx) => {
                 ConnectState::find_valid_uri(ctx.uri.as_deref(), ctx.pages.first())
             }
+            Resolve::Page { ref url, .. } => Some(url.as_str()),
         }
         .or(self.fallback.as_deref())
     }
@@ -88,6 +120,9 @@ impl ResolveContext {
         match self.resolve {
             Resolve::Uri(ref uri) => uri,
             Resolve::Context(ref ctx) => ctx.uri.as_deref().unwrap_or_default(),
+            Resolve::Page {
+                ref context_uri, ..
+            } => context_uri,
         }
     }
 }
@@ -128,6 +163,10 @@ pub struct ContextResolver {
 
 // time after which an unavailable context is retried
 const RETRY_UNAVAILABLE: Duration = Duration::from_secs(3600);
+
+fn has_tracks(context: &Context) -> bool {
+    context.pages.iter().any(|page| !page.tracks.is_empty())
+}
 
 impl ContextResolver {
     pub fn pending(&self) -> VecDeque<ResolveContext> {
@@ -221,12 +260,45 @@ impl ContextResolver {
     ) -> Result<Context, Error> {
         let (next, resolve_uri, _) = self.find_next().ok_or(ContextResolverError::NoNext)?;
 
+        if let Resolve::Page { ref url, .. } = next.resolve {
+            let page = self.session.spclient().get_context_page(url).await?;
+            return Ok(Context {
+                uri: Some(next.context_uri().to_string()),
+                pages: vec![page],
+                ..Default::default()
+            });
+        }
+
         match next.update {
             ContextType::Default => {
-                let mut ctx = self.session.spclient().get_context(resolve_uri).await;
+                let spclient = self.session.spclient();
+                let mut ctx = match next.session_url {
+                    Some(ref url) => spclient.get_context_from_url(url).await,
+                    None => spclient.get_context(resolve_uri).await,
+                };
+
+                // A context with no track list of its own, such as the DJ,
+                // is played from a session made for the listener.
+                let context_uri = next.context_uri();
+                if next.session_url.is_none()
+                    && context_uri.starts_with("spotify:playlist:")
+                    && !ctx.as_ref().is_ok_and(has_tracks)
+                {
+                    debug!("<{context_uri}> has no tracks, trying it as a session");
+                    let url = SpClient::context_session_url(context_uri);
+                    match spclient.get_context_from_url(&url).await {
+                        Ok(session) if has_tracks(&session) => ctx = Ok(session),
+                        Ok(_) => debug!("the session for <{context_uri}> has no tracks either"),
+                        Err(why) => debug!("no session for <{context_uri}>: {why}"),
+                    }
+                }
+
                 if let Ok(ctx) = ctx.as_mut() {
-                    ctx.uri = Some(next.context_uri().to_string());
-                    ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
+                    ctx.uri = Some(context_uri.to_string());
+                    // a session keeps its own url, which other clients use to follow it
+                    if !matches!(ctx.url, Some(ref url) if url.starts_with("hm://")) {
+                        ctx.url = ctx.uri.as_ref().map(|s| format!("context://{s}"));
+                    }
                 }
 
                 ctx
@@ -351,5 +423,49 @@ impl ContextResolver {
         state.update_queue_revision();
 
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_next_page_resolves_by_its_url_into_its_context() {
+        let url = "hm://lexicon-session-provider/context-resolve/v2/session/0?previousSegmentId=1";
+        let page = ResolveContext::from_page("spotify:playlist:37i9dQZF1EYkqdzj48dyYq", url);
+        assert_eq!(page.resolve_uri(), Some(url));
+        assert_eq!(
+            page.context_uri(),
+            "spotify:playlist:37i9dQZF1EYkqdzj48dyYq"
+        );
+        assert_eq!(page.action, ContextAction::Append);
+        assert_eq!(page.update, ContextType::Default);
+    }
+
+    #[test]
+    fn a_session_url_is_kept_only_when_given() {
+        let resolve = ResolveContext::from_uri(
+            "spotify:playlist:37i9dQZF1EYkqdzj48dyYq",
+            "",
+            ContextType::Default,
+            ContextAction::Replace,
+        );
+        assert_eq!(resolve.clone().with_session_url(None).session_url, None);
+        assert_eq!(
+            resolve
+                .clone()
+                .with_session_url(Some(String::new()))
+                .session_url,
+            None
+        );
+        let url = "hm://lexicon-session-provider/context-resolve/v2/session?contextUri=x";
+        assert_eq!(
+            resolve
+                .with_session_url(Some(url.into()))
+                .session_url
+                .as_deref(),
+            Some(url)
+        );
     }
 }

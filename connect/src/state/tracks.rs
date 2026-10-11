@@ -373,6 +373,16 @@ impl<'ct> ConnectState {
         SpotifyUri::from_uri(next).ok()
     }
 
+    /// The track that plays after the current one, as `preview_next_track`
+    /// finds it.
+    pub fn preview_next_provided_track(&self) -> Option<&ProvidedTrack> {
+        if self.repeat_track() {
+            self.player().track.as_ref()
+        } else {
+            self.next_tracks().first()
+        }
+    }
+
     pub fn has_next_tracks(&self, min: Option<usize>) -> bool {
         if let Some(min) = min {
             self.next_tracks().len() >= min
