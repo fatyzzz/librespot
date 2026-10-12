@@ -78,7 +78,27 @@ impl AudioKeyManager {
         Ok(())
     }
 
+    /// Requests the key a few times: on a throttled connection to the access point the answer can be late,
+    /// and a single refusal is not always final.
     pub async fn request(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
+        const ATTEMPTS: u64 = 3;
+        let mut last_error = None;
+        for attempt in 1..=ATTEMPTS {
+            match self.request_once(track, file).await {
+                Ok(key) => return Ok(key),
+                Err(e) => {
+                    warn!("Audio key attempt {attempt} of {ATTEMPTS} failed: {e}");
+                    last_error = Some(e);
+                }
+            }
+            if attempt < ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| AudioKeyError::Timeout.into()))
+    }
+
+    async fn request_once(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
         let (tx, rx) = oneshot::channel();
 
         let seq = self.lock(move |inner| {
@@ -88,10 +108,11 @@ impl AudioKeyManager {
         });
 
         self.send_key_request(seq, track, file)?;
-        const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
+        const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(3000);
         match tokio::time::timeout(KEY_RESPONSE_TIMEOUT, rx).await {
             Err(_) => {
                 error!("Audio key response timeout");
+                self.lock(|inner| inner.pending.remove(&seq));
                 Err(AudioKeyError::Timeout.into())
             }
             Ok(k) => k?,
