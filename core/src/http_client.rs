@@ -162,7 +162,22 @@ impl HttpClient {
         // When not using a proxy a dummy proxy is configured that will not intercept any traffic.
         // This prevents needing to carry the Client Connector generics through the whole project
         let proxy = match &proxy_url {
-            Some(proxy_url) => Proxy::new(Intercept::All, proxy_url.to_string().parse()?),
+            Some(proxy_url) => {
+                // the login goes in Proxy-Authorization, not in the proxy URI; every request is
+                // tunnelled with CONNECT so plain-HTTP ones carry it too
+                let mut address = (*proxy_url).clone();
+                let _ = address.set_username("");
+                let _ = address.set_password(None);
+                let mut proxy = Proxy::new(Intercept::All, address.to_string().parse()?);
+                if let Some(authorization) = crate::proxytunnel::basic_auth(proxy_url) {
+                    proxy.set_header(
+                        http::header::PROXY_AUTHORIZATION,
+                        http::HeaderValue::from_str(&authorization)?,
+                    );
+                    proxy.force_connect();
+                }
+                proxy
+            }
             None => Proxy::new(Intercept::None, Uri::from_static("0.0.0.0")),
         };
         let proxy_connector = ProxyConnector::from_proxy(https_connector, proxy)?;

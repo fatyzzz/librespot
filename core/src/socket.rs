@@ -64,7 +64,9 @@ where
         if proxy.is_some() {
             // Resolve only the proxy locally. Never bypass it after a refused
             // CONNECT, and never put proxy credentials in connection logs.
-            proxytunnel::proxy_connect(socket, host, &port.to_string()).await
+            let authorization = proxy.and_then(proxytunnel::basic_auth);
+            proxytunnel::proxy_connect(socket, host, &port.to_string(), authorization.as_deref())
+                .await
         } else {
             Ok(socket)
         }
@@ -290,7 +292,7 @@ mod tests {
             let (mut server, _) = listener.accept().await.unwrap();
             assert_eq!(
                 read_connect(&mut server).await,
-                b"CONNECT unresolved-target.invalid:4070 HTTP/1.1\r\n\r\n"
+                b"CONNECT unresolved-target.invalid:4070 HTTP/1.1\r\nHost: unresolved-target.invalid:4070\r\n\r\n"
             );
             server.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
             assert_eq!(server.read_u8().await.unwrap(), 42);
