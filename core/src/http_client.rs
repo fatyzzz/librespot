@@ -163,8 +163,9 @@ impl HttpClient {
         // This prevents needing to carry the Client Connector generics through the whole project
         let proxy = match &proxy_url {
             Some(proxy_url) => {
-                // the login goes in Proxy-Authorization, not in the proxy URI; every request is
-                // tunnelled with CONNECT so plain-HTTP ones carry it too
+                // Every request is tunnelled with CONNECT, plain-HTTP audio CDN ones too: many proxies
+                // only tunnel and refuse absolute-form `GET http://...` (official clients tunnel too).
+                // The login goes in Proxy-Authorization, not in the proxy URI.
                 let mut address = (*proxy_url).clone();
                 let _ = address.set_username("");
                 let _ = address.set_password(None);
@@ -174,8 +175,8 @@ impl HttpClient {
                         http::header::PROXY_AUTHORIZATION,
                         http::HeaderValue::from_str(&authorization)?,
                     );
-                    proxy.force_connect();
                 }
+                proxy.force_connect();
                 proxy
             }
             None => Proxy::new(Intercept::None, Uri::from_static("0.0.0.0")),
