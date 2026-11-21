@@ -11,7 +11,13 @@ pub(crate) const IOS_CLIENT_ID: &str = "58bd3c95768941ea9eb4350aaa033eb3";
 // android or ios needs to be mocked, the `os_version` has to be set to a valid version.
 // Otherwise, client-token or login5 requests will fail with a generic invalid-credential error.
 /// See [std::env::consts::OS]
-pub const OS: &str = std::env::consts::OS;
+// Materialfy uses the desktop OAuth client on Android. The access point
+// rejects that client's token when paired with the Android platform ID.
+pub const OS: &str = if cfg!(target_os = "android") {
+    "linux"
+} else {
+    std::env::consts::OS
+};
 
 // valid versions for some os:
 // 'android': 30
